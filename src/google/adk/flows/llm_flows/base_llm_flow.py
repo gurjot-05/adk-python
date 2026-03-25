@@ -65,6 +65,39 @@ logger = logging.getLogger('google_adk.' + __name__)
 
 _ADK_AGENT_NAME_LABEL_KEY = 'adk_agent_name'
 
+# Maximum number of retries when the model returns an empty response after
+# tool execution. Prevents infinite loops if the model keeps returning empty.
+_MAX_EMPTY_RESPONSE_RETRIES = 2
+
+# Message injected into the conversation when the model returns an empty
+# response, nudging it to resume execution on the next attempt.
+_EMPTY_RESPONSE_RESUME_MESSAGE = (
+    'Your previous response was empty. '
+    'Please resume execution from where you left off.'
+)
+
+
+def _has_meaningful_content(event: Event) -> bool:
+  """Returns whether the event has content worth showing to the user.
+
+  An event with no content, empty parts, or only thought / whitespace parts
+  is not meaningful. Used to detect empty model responses after tool
+  execution so the loop can re-prompt instead of silently halting.
+  """
+  if not event.content or not event.content.parts:
+    return False
+  for part in event.content.parts:
+    if part.function_call or part.function_response:
+      return True
+    if part.thought:
+      continue
+    if part.text and part.text.strip():
+      return True
+    if part.inline_data or part.file_data:
+      return True
+  return False
+
+
 # Timing configuration
 DEFAULT_TRANSFER_AGENT_DELAY = 1.0
 DEFAULT_TASK_COMPLETION_DELAY = 1.0
@@ -748,15 +781,45 @@ class BaseLlmFlow(ABC):
       self, invocation_context: InvocationContext
   ) -> AsyncGenerator[Event, None]:
     """Runs the flow."""
+    empty_response_count = 0
     while True:
       last_event = None
       async with Aclosing(self._run_one_step_async(invocation_context)) as agen:
         async for event in agen:
           last_event = event
           yield event
-      if not last_event or last_event.is_final_response() or last_event.partial:
+      if not last_event or last_event.partial:
         if last_event and last_event.partial:
           logger.warning('The last event is partial, which is not expected.')
+        break
+      if last_event.is_final_response():
+        if (
+            not _has_meaningful_content(last_event)
+            and last_event.author == invocation_context.agent.name
+            and empty_response_count < _MAX_EMPTY_RESPONSE_RETRIES
+        ):
+          empty_response_count += 1
+          logger.warning(
+              'Model returned an empty response (attempt %d/%d),'
+              ' injecting resume message and re-prompting.',
+              empty_response_count,
+              _MAX_EMPTY_RESPONSE_RETRIES,
+          )
+          # Inject a resume nudge into the session so the next LLM call
+          # sees it in its context and is more likely to continue.
+          resume_event = Event(
+              invocation_id=invocation_context.invocation_id,
+              author='user',
+              branch=invocation_context.branch,
+              content=types.Content(
+                  role='user',
+                  parts=[
+                      types.Part.from_text(text=_EMPTY_RESPONSE_RESUME_MESSAGE)
+                  ],
+              ),
+          )
+          yield resume_event
+          continue
         break
 
   async def _run_one_step_async(
