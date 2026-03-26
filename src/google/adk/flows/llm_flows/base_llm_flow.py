@@ -788,38 +788,57 @@ class BaseLlmFlow(ABC):
         async for event in agen:
           last_event = event
           yield event
-      if not last_event or last_event.partial:
+
+      # Determine if the model returned an empty / useless response that
+      # should be retried.  Three cases:
+      #   1. No event at all (model/adapter yielded nothing)
+      #   2. Last event is partial with no meaningful content (streaming +
+      #      thinking: only thought chunks arrived, no final response)
+      #   3. Last event is a final response with no meaningful content
+      #      (non-streaming empty response, or streaming empty aggregated)
+      is_empty_response = False
+      if not last_event:
+        is_empty_response = True
+      elif last_event.partial and not _has_meaningful_content(last_event):
+        is_empty_response = True
+      elif (
+          last_event.is_final_response()
+          and not _has_meaningful_content(last_event)
+          and last_event.author == invocation_context.agent.name
+      ):
+        is_empty_response = True
+
+      if (
+          is_empty_response
+          and empty_response_count < _MAX_EMPTY_RESPONSE_RETRIES
+      ):
+        empty_response_count += 1
+        logger.warning(
+            'Model returned an empty response (attempt %d/%d),'
+            ' injecting resume message and re-prompting.',
+            empty_response_count,
+            _MAX_EMPTY_RESPONSE_RETRIES,
+        )
+        # Inject a resume nudge into the session so the next LLM call
+        # sees it in its context and is more likely to continue.
+        resume_event = Event(
+            invocation_id=invocation_context.invocation_id,
+            author='user',
+            branch=invocation_context.branch,
+            content=types.Content(
+                role='user',
+                parts=[
+                    types.Part.from_text(text=_EMPTY_RESPONSE_RESUME_MESSAGE)
+                ],
+            ),
+        )
+        yield resume_event
+        continue
+
+      # Normal termination conditions.
+      if not last_event or last_event.is_final_response() or last_event.partial:
         if last_event and last_event.partial:
           logger.warning('The last event is partial, which is not expected.')
-        break
-      if last_event.is_final_response():
-        if (
-            not _has_meaningful_content(last_event)
-            and last_event.author == invocation_context.agent.name
-            and empty_response_count < _MAX_EMPTY_RESPONSE_RETRIES
-        ):
-          empty_response_count += 1
-          logger.warning(
-              'Model returned an empty response (attempt %d/%d),'
-              ' injecting resume message and re-prompting.',
-              empty_response_count,
-              _MAX_EMPTY_RESPONSE_RETRIES,
-          )
-          # Inject a resume nudge into the session so the next LLM call
-          # sees it in its context and is more likely to continue.
-          resume_event = Event(
-              invocation_id=invocation_context.invocation_id,
-              author='user',
-              branch=invocation_context.branch,
-              content=types.Content(
-                  role='user',
-                  parts=[
-                      types.Part.from_text(text=_EMPTY_RESPONSE_RESUME_MESSAGE)
-                  ],
-              ),
-          )
-          yield resume_event
-          continue
         break
 
   async def _run_one_step_async(

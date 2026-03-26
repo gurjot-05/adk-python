@@ -91,12 +91,18 @@ async def test_run_async_breaks_on_final_response():
 
 
 @pytest.mark.asyncio
-async def test_run_async_breaks_on_no_last_event():
-  """Test that run_async breaks when there is no last event."""
-  # Create a mock model that returns an empty response (no content)
-  empty_response = LlmResponse(content=None, partial=False)
+async def test_run_async_retries_then_breaks_on_no_last_event():
+  """Test that run_async retries when there is no last event, then breaks."""
+  # Create a mock model that returns empty responses (no content).
+  # Need enough responses to cover initial call + max retries.
+  from google.adk.flows.llm_flows.base_llm_flow import _MAX_EMPTY_RESPONSE_RETRIES
 
-  mock_model = testing_utils.MockModel.create(responses=[empty_response])
+  empty_responses = [
+      LlmResponse(content=None, partial=False)
+      for _ in range(_MAX_EMPTY_RESPONSE_RETRIES + 1)
+  ]
+
+  mock_model = testing_utils.MockModel.create(responses=empty_responses)
 
   agent = Agent(name='test_agent', model=mock_model)
   invocation_context = await testing_utils.create_invocation_context(
@@ -110,8 +116,11 @@ async def test_run_async_breaks_on_no_last_event():
   async for event in flow.run_async(invocation_context):
     events.append(event)
 
-  # Should have no events because empty responses are filtered out
-  assert len(events) == 0
+  # Should have resume events from retry attempts (one per retry).
+  # The empty LlmResponse has content=None, so _postprocess_async filters
+  # it out — no model events are yielded, only resume nudge events.
+  resume_events = [e for e in events if e.author == 'user']
+  assert len(resume_events) == _MAX_EMPTY_RESPONSE_RETRIES
 
 
 @pytest.mark.asyncio
