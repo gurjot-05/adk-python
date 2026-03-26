@@ -69,13 +69,6 @@ _ADK_AGENT_NAME_LABEL_KEY = 'adk_agent_name'
 # tool execution. Prevents infinite loops if the model keeps returning empty.
 _MAX_EMPTY_RESPONSE_RETRIES = 2
 
-# Message injected into the conversation when the model returns an empty
-# response, nudging it to resume execution on the next attempt.
-_EMPTY_RESPONSE_RESUME_MESSAGE = (
-    'Your previous response was empty. '
-    'Please resume execution from where you left off.'
-)
-
 
 def _has_meaningful_content(event: Event) -> bool:
   """Returns whether the event has content worth showing to the user.
@@ -782,27 +775,35 @@ class BaseLlmFlow(ABC):
   ) -> AsyncGenerator[Event, None]:
     """Runs the flow."""
     empty_response_count = 0
+    has_prior_tool_call = False
     while True:
       last_event = None
       async with Aclosing(self._run_one_step_async(invocation_context)) as agen:
         async for event in agen:
           last_event = event
           yield event
+          # Track if any tool calls have been executed in this invocation.
+          # Empty responses are only retried after tool execution because
+          # that is where models intermittently return 0 output tokens.
+          if event.get_function_calls():
+            has_prior_tool_call = True
 
       # Determine if the model returned an empty / useless response that
       # should be retried.  Three cases:
-      #   1. No event at all (model/adapter yielded nothing)
-      #   2. Last event is partial with no meaningful content (streaming +
+      #   1. Last event is partial with no meaningful content (streaming +
       #      thinking: only thought chunks arrived, no final response)
-      #   3. Last event is a final response with no meaningful content
+      #   2. Last event is a final response with no meaningful content
       #      (non-streaming empty response, or streaming empty aggregated)
       is_empty_response = False
-      if not last_event:
-        is_empty_response = True
-      elif last_event.partial and not _has_meaningful_content(last_event):
+      if (
+          last_event
+          and last_event.partial
+          and not _has_meaningful_content(last_event)
+      ):
         is_empty_response = True
       elif (
-          last_event.is_final_response()
+          last_event
+          and last_event.is_final_response()
           and not _has_meaningful_content(last_event)
           and last_event.author == invocation_context.agent.name
       ):
@@ -815,34 +816,14 @@ class BaseLlmFlow(ABC):
 
       if (
           is_empty_response
+          and has_prior_tool_call
           and empty_response_count < _MAX_EMPTY_RESPONSE_RETRIES
       ):
         empty_response_count += 1
         logger.warning(
-            'Model returned an empty response (attempt %d/%d),'
-            ' injecting resume message and re-prompting.',
+            'Model returned an empty response (attempt %d/%d), re-prompting.',
             empty_response_count,
             _MAX_EMPTY_RESPONSE_RETRIES,
-        )
-        # Inject a resume nudge into the session so the next LLM call
-        # sees it in its context and is more likely to continue.
-        # We append directly to the session (not yield) so that the
-        # message reaches the model but is NOT sent to the UI/SSE stream.
-        resume_event = Event(
-            id=Event.new_id(),
-            invocation_id=invocation_context.invocation_id,
-            author='user',
-            branch=invocation_context.branch,
-            content=types.Content(
-                role='user',
-                parts=[
-                    types.Part.from_text(text=_EMPTY_RESPONSE_RESUME_MESSAGE)
-                ],
-            ),
-        )
-        await invocation_context.session_service.append_event(
-            session=invocation_context.session,
-            event=resume_event,
         )
         continue
 

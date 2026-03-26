@@ -14,10 +14,9 @@
 
 """Comprehensive tests for empty model response retry across all scenarios.
 
-The resume message is appended directly to the session (not yielded),
-so it reaches the model on retry but never leaks to the UI/SSE stream.
-We verify retries via mock_model.response_index and confirm no user
-events are yielded.
+Retry only fires after at least one tool call in the invocation, since
+the bug manifests when the model returns empty after processing tool
+results.  Each test therefore includes a tool-call response first.
 """
 
 from google.adk.agents.llm_agent import Agent
@@ -26,6 +25,7 @@ from google.adk.flows.llm_flows.base_llm_flow import _has_meaningful_content
 from google.adk.flows.llm_flows.base_llm_flow import _MAX_EMPTY_RESPONSE_RETRIES
 from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
 from google.adk.models.llm_response import LlmResponse
+from google.adk.tools import FunctionTool
 from google.genai import types
 import pytest
 
@@ -36,42 +36,60 @@ class BaseLlmFlowForTesting(BaseLlmFlow):
   pass
 
 
-def _collect_resume_leaks(events):
-  """Return any resume nudge events that leaked to the output stream."""
-  return [
-      e
-      for e in events
-      if e.author == 'user'
-      and e.content
-      and e.content.parts
-      and any(
-          'previous response was empty' in (p.text or '')
-          for p in e.content.parts
-      )
-  ]
+def _test_tool_func(key: str = 'value') -> dict:
+  """A dummy tool for testing."""
+  return {'result': 'ok'}
+
+
+_TEST_TOOL = FunctionTool(func=_test_tool_func)
+
+
+def _tool_call_response():
+  """A function-call response that triggers has_prior_tool_call."""
+  return LlmResponse(
+      content=types.Content(
+          role='model',
+          parts=[
+              types.Part(
+                  function_call=types.FunctionCall(
+                      name='_test_tool_func', args={'key': 'value'}
+                  )
+              )
+          ],
+      ),
+      partial=False,
+  )
+
+
+def _empty_response():
+  return LlmResponse(
+      content=types.Content(role='model', parts=[]),
+      partial=False,
+  )
+
+
+def _good_response(text='Here is the answer.'):
+  return LlmResponse(
+      content=types.Content(
+          role='model',
+          parts=[types.Part.from_text(text=text)],
+      ),
+      partial=False,
+  )
 
 
 # ---------------------------------------------------------------------------
-# Scenario 1: Non-streaming empty response, then recovery
+# Scenario 1: Non-streaming empty response after tool call, then recovery
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_scenario1_non_streaming_empty_then_recovery():
-  """Non-streaming: model returns empty parts, retry recovers."""
-  empty = LlmResponse(
-      content=types.Content(role='model', parts=[]),
-      partial=False,
+  """Non-streaming: model returns empty parts after tool call, retry recovers."""
+  mock_model = testing_utils.MockModel.create(
+      responses=[_tool_call_response(), _empty_response(), _good_response()]
   )
-  good = LlmResponse(
-      content=types.Content(
-          role='model',
-          parts=[types.Part.from_text(text='Here is the answer.')],
-      ),
-      partial=False,
-  )
-  mock_model = testing_utils.MockModel.create(responses=[empty, good])
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -80,11 +98,8 @@ async def test_scenario1_non_streaming_empty_then_recovery():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  # Model called twice (empty + good)
-  assert mock_model.response_index == 1
-  # Resume message must NOT leak to UI
-  assert len(_collect_resume_leaks(events)) == 0
-  # Good response should be in output
+  # All 3 responses consumed: tool call + empty (retried) + good
+  assert mock_model.response_index == 2
   good_texts = [
       p.text
       for e in events
@@ -96,13 +111,13 @@ async def test_scenario1_non_streaming_empty_then_recovery():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 2: Thought-only final response triggers retry
+# Scenario 2: Thought-only final response after tool call
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_scenario2_thought_only_final_response_retried():
-  """Thought-only non-partial response triggers retry."""
+  """Thought-only non-partial response triggers retry after tool call."""
   thought_only = LlmResponse(
       content=types.Content(
           role='model',
@@ -110,15 +125,10 @@ async def test_scenario2_thought_only_final_response_retried():
       ),
       partial=False,
   )
-  good = LlmResponse(
-      content=types.Content(
-          role='model',
-          parts=[types.Part.from_text(text='The answer is 42.')],
-      ),
-      partial=False,
+  mock_model = testing_utils.MockModel.create(
+      responses=[_tool_call_response(), thought_only, _good_response()]
   )
-  mock_model = testing_utils.MockModel.create(responses=[thought_only, good])
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -127,24 +137,20 @@ async def test_scenario2_thought_only_final_response_retried():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  assert mock_model.response_index == 1, 'Expected 2 LLM calls (retry)'
-  assert len(_collect_resume_leaks(events)) == 0
+  assert mock_model.response_index == 2, 'Expected 3 LLM calls (tool + retry)'
 
 
 # ---------------------------------------------------------------------------
-# Scenario 3a: No events yielded at all (last_event=None)
+# Scenario 3a: No events at all (breaks, no retry)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_scenario3a_no_events_at_all_retried():
-  """When _run_one_step yields nothing, retry fires."""
-  empty_responses = [
-      LlmResponse(content=None, partial=False)
-      for _ in range(_MAX_EMPTY_RESPONSE_RETRIES + 1)
-  ]
-  mock_model = testing_utils.MockModel.create(responses=empty_responses)
-  agent = Agent(name='test_agent', model=mock_model)
+async def test_scenario3a_no_events_at_all_breaks():
+  """When _run_one_step yields nothing, loop breaks (no retry)."""
+  empty_response = LlmResponse(content=None, partial=False)
+  mock_model = testing_utils.MockModel.create(responses=[empty_response])
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -153,32 +159,26 @@ async def test_scenario3a_no_events_at_all_retried():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  # Model called initial + retries times
-  assert mock_model.response_index == _MAX_EMPTY_RESPONSE_RETRIES
-  assert len(_collect_resume_leaks(events)) == 0
+  assert mock_model.response_index == 0
+  assert len(events) == 0
 
 
 # ---------------------------------------------------------------------------
-# Scenario 3b: Partial event with no meaningful content
+# Scenario 3b: Partial event with no meaningful content after tool call
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_scenario3b_partial_empty_content_retried():
-  """Partial event with empty parts triggers retry."""
+  """Partial event with empty parts triggers retry after tool call."""
   partial_empty = LlmResponse(
       content=types.Content(role='model', parts=[]),
       partial=True,
   )
-  good = LlmResponse(
-      content=types.Content(
-          role='model',
-          parts=[types.Part.from_text(text='Here is the answer.')],
-      ),
-      partial=False,
+  mock_model = testing_utils.MockModel.create(
+      responses=[_tool_call_response(), partial_empty, _good_response()]
   )
-  mock_model = testing_utils.MockModel.create(responses=[partial_empty, good])
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -187,13 +187,12 @@ async def test_scenario3b_partial_empty_content_retried():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  assert mock_model.response_index == 1, 'Expected retry on partial empty'
-  assert len(_collect_resume_leaks(events)) == 0
+  assert mock_model.response_index == 2, 'Expected retry on partial empty'
 
 
 @pytest.mark.asyncio
 async def test_scenario3b_partial_thought_only_retried():
-  """Partial event with thought-only content triggers retry."""
+  """Partial event with thought-only content triggers retry after tool call."""
   partial_thought = LlmResponse(
       content=types.Content(
           role='model',
@@ -201,15 +200,10 @@ async def test_scenario3b_partial_thought_only_retried():
       ),
       partial=True,
   )
-  good = LlmResponse(
-      content=types.Content(
-          role='model',
-          parts=[types.Part.from_text(text='Done thinking, here it is.')],
-      ),
-      partial=False,
+  mock_model = testing_utils.MockModel.create(
+      responses=[_tool_call_response(), partial_thought, _good_response()]
   )
-  mock_model = testing_utils.MockModel.create(responses=[partial_thought, good])
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -218,8 +212,7 @@ async def test_scenario3b_partial_thought_only_retried():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  assert mock_model.response_index == 1, 'Expected retry on partial thought'
-  assert len(_collect_resume_leaks(events)) == 0
+  assert mock_model.response_index == 2, 'Expected retry on partial thought'
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +231,7 @@ async def test_scenario4_partial_with_meaningful_content_not_retried():
       partial=True,
   )
   mock_model = testing_utils.MockModel.create(responses=[partial_with_text])
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -247,29 +240,24 @@ async def test_scenario4_partial_with_meaningful_content_not_retried():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  # Only 1 LLM call — no retry
   assert mock_model.response_index == 0
   partial_events = [e for e in events if e.partial]
   assert len(partial_events) == 1
 
 
 # ---------------------------------------------------------------------------
-# Scenario 5: Empty response exhausts max retries
+# Scenario 5: Empty response exhausts max retries after tool call
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_scenario5_empty_exhausts_max_retries():
   """Empty responses stop after max retries."""
-  empty_responses = [
-      LlmResponse(
-          content=types.Content(role='model', parts=[]),
-          partial=False,
-      )
-      for _ in range(_MAX_EMPTY_RESPONSE_RETRIES + 1)
+  responses = [_tool_call_response()] + [
+      _empty_response() for _ in range(_MAX_EMPTY_RESPONSE_RETRIES + 1)
   ]
-  mock_model = testing_utils.MockModel.create(responses=empty_responses)
-  agent = Agent(name='test_agent', model=mock_model)
+  mock_model = testing_utils.MockModel.create(responses=responses)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -278,13 +266,12 @@ async def test_scenario5_empty_exhausts_max_retries():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  # Model called initial + retries = MAX_RETRIES + 1
-  assert mock_model.response_index == _MAX_EMPTY_RESPONSE_RETRIES
-  assert len(_collect_resume_leaks(events)) == 0
+  # tool_call + initial empty + MAX retries
+  assert mock_model.response_index == _MAX_EMPTY_RESPONSE_RETRIES + 1
 
 
 # ---------------------------------------------------------------------------
-# Scenario 6: Empty -> Empty -> Good (recovery after multiple retries)
+# Scenario 6: Empty -> Empty -> Good after tool call
 # ---------------------------------------------------------------------------
 
 
@@ -292,24 +279,13 @@ async def test_scenario5_empty_exhausts_max_retries():
 async def test_scenario6_multiple_empty_then_recovery():
   """Multiple empty responses followed by good response."""
   responses = [
-      LlmResponse(
-          content=types.Content(role='model', parts=[]),
-          partial=False,
-      ),
-      LlmResponse(
-          content=types.Content(role='model', parts=[]),
-          partial=False,
-      ),
-      LlmResponse(
-          content=types.Content(
-              role='model',
-              parts=[types.Part.from_text(text='Finally recovered!')],
-          ),
-          partial=False,
-      ),
+      _tool_call_response(),
+      _empty_response(),
+      _empty_response(),
+      _good_response('Finally recovered!'),
   ]
   mock_model = testing_utils.MockModel.create(responses=responses)
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -318,9 +294,7 @@ async def test_scenario6_multiple_empty_then_recovery():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  # All 3 responses consumed
-  assert mock_model.response_index == 2
-  assert len(_collect_resume_leaks(events)) == 0
+  assert mock_model.response_index == 3
   final_texts = [
       p.text
       for e in events
@@ -354,13 +328,13 @@ def test_scenario7_litellm_fallback_response_is_not_partial():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 8: Whitespace-only text response
+# Scenario 8: Whitespace-only text response after tool call
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_scenario8_whitespace_only_response_retried():
-  """Response with only whitespace text triggers retry."""
+  """Response with only whitespace text triggers retry after tool call."""
   whitespace = LlmResponse(
       content=types.Content(
           role='model',
@@ -368,15 +342,10 @@ async def test_scenario8_whitespace_only_response_retried():
       ),
       partial=False,
   )
-  good = LlmResponse(
-      content=types.Content(
-          role='model',
-          parts=[types.Part.from_text(text='Actual content.')],
-      ),
-      partial=False,
+  mock_model = testing_utils.MockModel.create(
+      responses=[_tool_call_response(), whitespace, _good_response()]
   )
-  mock_model = testing_utils.MockModel.create(responses=[whitespace, good])
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -385,8 +354,7 @@ async def test_scenario8_whitespace_only_response_retried():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  assert mock_model.response_index == 1, 'Expected retry on whitespace'
-  assert len(_collect_resume_leaks(events)) == 0
+  assert mock_model.response_index == 2, 'Expected retry on whitespace'
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +383,7 @@ def test_scenario9_function_call_is_meaningful():
 
 
 # ---------------------------------------------------------------------------
-# Scenario 10: Partial empty then partial with content
+# Scenario 10: Partial empty then partial with content after tool call
 # ---------------------------------------------------------------------------
 
 
@@ -434,9 +402,9 @@ async def test_scenario10_partial_empty_then_partial_with_content():
       partial=True,
   )
   mock_model = testing_utils.MockModel.create(
-      responses=[partial_empty, partial_real]
+      responses=[_tool_call_response(), partial_empty, partial_real]
   )
-  agent = Agent(name='test_agent', model=mock_model)
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
   ctx = await testing_utils.create_invocation_context(
       agent=agent, user_content='test'
   )
@@ -445,6 +413,26 @@ async def test_scenario10_partial_empty_then_partial_with_content():
   async for event in BaseLlmFlowForTesting().run_async(ctx):
     events.append(event)
 
-  # Both responses consumed (retry on first, break on second)
-  assert mock_model.response_index == 1
-  assert len(_collect_resume_leaks(events)) == 0
+  assert mock_model.response_index == 2
+
+
+# ---------------------------------------------------------------------------
+# Scenario 11: Empty response WITHOUT prior tool call (should NOT retry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scenario11_empty_without_tool_call_not_retried():
+  """Empty response on first LLM call (no tool call) should NOT retry."""
+  mock_model = testing_utils.MockModel.create(responses=[_empty_response()])
+  agent = Agent(name='test_agent', model=mock_model, tools=[_TEST_TOOL])
+  ctx = await testing_utils.create_invocation_context(
+      agent=agent, user_content='test'
+  )
+
+  events = []
+  async for event in BaseLlmFlowForTesting().run_async(ctx):
+    events.append(event)
+
+  # Only 1 model call -- no retry without prior tool call
+  assert mock_model.response_index == 0

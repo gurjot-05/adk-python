@@ -91,18 +91,14 @@ async def test_run_async_breaks_on_final_response():
 
 
 @pytest.mark.asyncio
-async def test_run_async_retries_then_breaks_on_no_last_event():
-  """Test that run_async retries when there is no last event, then breaks."""
-  # Create a mock model that returns empty responses (no content).
-  # Need enough responses to cover initial call + max retries.
-  from google.adk.flows.llm_flows.base_llm_flow import _MAX_EMPTY_RESPONSE_RETRIES
+async def test_run_async_breaks_on_no_last_event():
+  """Test that run_async breaks when there is no last event."""
+  # content=None is filtered by _postprocess_async, so no events are
+  # yielded and last_event stays None.  The loop should break immediately
+  # (no retry) because this is legitimate for sub-agents.
+  empty_response = LlmResponse(content=None, partial=False)
 
-  empty_responses = [
-      LlmResponse(content=None, partial=False)
-      for _ in range(_MAX_EMPTY_RESPONSE_RETRIES + 1)
-  ]
-
-  mock_model = testing_utils.MockModel.create(responses=empty_responses)
+  mock_model = testing_utils.MockModel.create(responses=[empty_response])
 
   agent = Agent(name='test_agent', model=mock_model)
   invocation_context = await testing_utils.create_invocation_context(
@@ -116,12 +112,8 @@ async def test_run_async_retries_then_breaks_on_no_last_event():
   async for event in flow.run_async(invocation_context):
     events.append(event)
 
-  # Resume events are appended to session (not yielded), so no user
-  # events should appear in the output stream.  Verify retries happened
-  # by checking how many responses were consumed.
-  assert mock_model.response_index == _MAX_EMPTY_RESPONSE_RETRIES
-  leaked = [e for e in events if e.author == 'user']
-  assert len(leaked) == 0, 'Resume messages must not leak to output'
+  # Should have no events because empty responses are filtered out
+  assert len(events) == 0
 
 
 @pytest.mark.asyncio
