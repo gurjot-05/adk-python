@@ -821,7 +821,10 @@ class BaseLlmFlow(ABC):
         )
         # Inject a resume nudge into the session so the next LLM call
         # sees it in its context and is more likely to continue.
+        # We append directly to the session (not yield) so that the
+        # message reaches the model but is NOT sent to the UI/SSE stream.
         resume_event = Event(
+            id=Event.new_id(),
             invocation_id=invocation_context.invocation_id,
             author='user',
             branch=invocation_context.branch,
@@ -832,7 +835,10 @@ class BaseLlmFlow(ABC):
                 ],
             ),
         )
-        yield resume_event
+        await invocation_context.session_service.append_event(
+            session=invocation_context.session,
+            event=resume_event,
+        )
         continue
 
       # Normal termination conditions.

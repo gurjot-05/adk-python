@@ -116,11 +116,12 @@ async def test_run_async_retries_then_breaks_on_no_last_event():
   async for event in flow.run_async(invocation_context):
     events.append(event)
 
-  # Should have resume events from retry attempts (one per retry).
-  # The empty LlmResponse has content=None, so _postprocess_async filters
-  # it out — no model events are yielded, only resume nudge events.
-  resume_events = [e for e in events if e.author == 'user']
-  assert len(resume_events) == _MAX_EMPTY_RESPONSE_RETRIES
+  # Resume events are appended to session (not yielded), so no user
+  # events should appear in the output stream.  Verify retries happened
+  # by checking how many responses were consumed.
+  assert mock_model.response_index == _MAX_EMPTY_RESPONSE_RETRIES
+  leaked = [e for e in events if e.author == 'user']
+  assert len(leaked) == 0, 'Resume messages must not leak to output'
 
 
 @pytest.mark.asyncio
