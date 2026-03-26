@@ -808,6 +808,11 @@ class BaseLlmFlow(ABC):
       ):
         is_empty_response = True
 
+      # Reset retry budget after a successful (non-empty) response so that
+      # later empty responses in the same invocation still get retried.
+      if not is_empty_response and empty_response_count > 0:
+        empty_response_count = 0
+
       if (
           is_empty_response
           and empty_response_count < _MAX_EMPTY_RESPONSE_RETRIES
@@ -840,6 +845,16 @@ class BaseLlmFlow(ABC):
             event=resume_event,
         )
         continue
+
+      if (
+          is_empty_response
+          and empty_response_count >= _MAX_EMPTY_RESPONSE_RETRIES
+      ):
+        logger.warning(
+            'Model returned an empty response but retry budget (%d) is'
+            ' exhausted. Halting.',
+            _MAX_EMPTY_RESPONSE_RETRIES,
+        )
 
       # Normal termination conditions.
       if not last_event or last_event.is_final_response() or last_event.partial:
