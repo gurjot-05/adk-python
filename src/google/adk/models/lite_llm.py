@@ -2030,6 +2030,10 @@ def _is_anthropic_model(model_string: str) -> bool:
   if lower.startswith("vertex_ai/"):
     model_part = lower.split("/", 1)[1]
     return "claude" in model_part
+  if lower.startswith("openai/"):                                                                                                                               
+    model_part = lower.split("/", 1)[1]                                                                                                                         
+    if "anthropic" in model_part or "claude" in model_part:                                                                                                    
+      return True
   return False
 
 
