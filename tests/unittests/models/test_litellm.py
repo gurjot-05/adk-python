@@ -4784,7 +4784,11 @@ def test_convert_reasoning_value_to_parts_preserves_signature_only_blocks():
   thinking_blocks = [
       {"type": "thinking", "thinking": "", "signature": "sig1"},
       {"type": "thinking", "thinking": "real thought", "signature": "sig2"},
-      {"type": "thinking", "thinking": "", "signature": ""},  # fully empty: drop
+      {
+          "type": "thinking",
+          "thinking": "",
+          "signature": "",
+      },  # fully empty: drop
   ]
   parts = _convert_reasoning_value_to_parts(thinking_blocks)
   assert len(parts) == 2
@@ -4920,7 +4924,9 @@ async def test_content_to_message_param_anthropic_aggregates_streaming_split_thi
           types.Part(text="GST research ", thought=True),
           types.Part(text="on secondment.", thought=True),
           # Final signature-only chunk (empty text, signature carries the whole block)
-          types.Part(text="", thought=True, thought_signature=b"ErEDClsIDBACGAIfull"),
+          types.Part(
+              text="", thought=True, thought_signature=b"ErEDClsIDBACGAIfull"
+          ),
           # Non-thought response content
           types.Part.from_function_call(name="create_plan", args={"q": "test"}),
       ],
